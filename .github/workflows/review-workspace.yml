@@ -1,0 +1,24 @@
+name: Review source workspace
+on:
+  push:
+    branches: [feature/ghost-auto-transcribe-icon]
+    paths: [.github/workflows/review-workspace.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 37773a174f9c2cb8e604c187ffc755ee580a4de4
+          persist-credentials: false
+      - name: Export reviewed sources
+        run: |
+          git archive --format=tar.gz --output=review-sources.tar.gz HEAD TMessagesProj/src/main/java/org/telegram/messenger TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java TMessagesProj/src/main/java/org/telegram/ui/Components/ChatActivityEnterView.java TMessagesProj/src/main/java/org/telegram/tgnet
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reviewed-sources-37773a1
+          path: review-sources.tar.gz
+          retention-days: 1
