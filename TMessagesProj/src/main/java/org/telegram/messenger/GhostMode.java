@@ -1,10 +1,8 @@
 package org.telegram.messenger;
 
-import org.telegram.tgnet.TLObject;
-
 /**
- * Keeps Telegram's local read state/UI intact while suppressing server-side
- * read acknowledgements.
+ * User-facing ghost-mode preference. Suppression is applied only in
+ * high-level message read paths, never in the generic network layer.
  */
 public final class GhostMode {
 
@@ -19,17 +17,5 @@ public final class GhostMode {
 
     public static void setEnabled(int account, boolean enabled) {
         MessagesController.getMainSettings(account).edit().putBoolean(PREF_KEY, enabled).apply();
-    }
-
-    public static boolean shouldBlockReadRequest(int account, TLObject request) {
-        if (!isEnabled(account) || request == null) {
-            return false;
-        }
-        String requestName = request.getClass().getSimpleName();
-        return "TL_messages_readHistory".equals(requestName)
-                || "TL_channels_readHistory".equals(requestName)
-                || "TL_messages_readEncryptedHistory".equals(requestName)
-                || "TL_messages_readMessageContents".equals(requestName)
-                || "TL_channels_readMessageContents".equals(requestName);
     }
 }
