@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: android-apk-${{ github.event.pull_request.number || github.ref }}
+  group: android-apk-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 env:
@@ -26,8 +26,6 @@ env:
 jobs:
   apk:
     name: Build ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && 'release' || 'debug' }} APK
-    # Same-repository PRs already get a push build. Fork PRs never get signing secrets.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -63,7 +61,7 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
         with:
-          cache-read-only: ${{ github.event_name == 'pull_request' }}
+          cache-read-only: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
 
       - name: Install build tools
         run: |
@@ -115,14 +113,16 @@ jobs:
           set -euo pipefail
           if [[ "$BUILD_TYPE" == release ]]; then
             TASK=assembleAfatRelease
+            HEAP=8g
           else
             TASK=assembleAfatDebug
+            HEAP=6g
             unset CI_KEY_ALIAS CI_KEY_PASSWORD CI_STORE_PASSWORD CI_KEYSTORE_PATH
           fi
           ./gradlew ":TMessagesProj_App:$TASK" \
             --init-script .github/ci/android.init.gradle \
             "-PciAbis=${ANDROID_ABIS// /,}" \
-            '-Dorg.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g' \
+            "-Dorg.gradle.jvmargs=-Xmx$HEAP -XX:MaxMetaspaceSize=1g" \
             --build-cache --max-workers=2 --console=plain --profile --stacktrace
           python3 .github/ci/verify-apk.py
 
