@@ -157,7 +157,6 @@ import org.telegram.messenger.FactCheckController;
 import org.telegram.messenger.FileLoader;
 import org.telegram.messenger.FileLog;
 import org.telegram.messenger.FlagSecureReason;
-import org.telegram.messenger.GhostMode;
 import org.telegram.messenger.HashtagSearchController;
 import org.telegram.messenger.ImageLoader;
 import org.telegram.messenger.ImageLocation;
@@ -2052,9 +2051,6 @@ public class ChatActivity extends BaseFragment implements
                         TranscribeButton.showOffTranscribe(msg);
                     }
                 }
-            }
-            if (scheduleDate == 0 && GhostMode.isEnabled(currentAccount)) {
-                sendReadAckAfterReply();
             }
         }
 
@@ -12821,22 +12817,6 @@ public class ChatActivity extends BaseFragment implements
         }
     }
 
-    private void sendReadAckAfterReply() {
-        int maxId = 0;
-        int maxDate = 0;
-        for (int i = 0; i < messages.size(); i++) {
-            MessageObject messageObject = messages.get(i);
-            if (messageObject == null || messageObject.messageOwner == null || messageObject.isOut() || messageObject.scheduled) {
-                continue;
-            }
-            if (messageObject.getId() > 0) {
-                maxId = Math.max(maxId, messageObject.getId());
-            }
-            maxDate = Math.max(maxDate, messageObject.messageOwner.date);
-        }
-        getMessagesController().sendReadAckAfterReply(dialog_id, threadMessageId, maxId, maxDate);
-    }
-
     private void afterMessageSend() {
         messageSuggestionParams = null;
         if (threadMessageId == 0 || isTopic) {
@@ -16177,13 +16157,16 @@ public class ChatActivity extends BaseFragment implements
             }
             if (chatMode != MODE_SCHEDULED && messageObject != null) {
                 int id = messageObject.getId();
-                if (
+                if (messageObject.getDialogId() == dialog_id && (
                     !isThreadChat() && visibleToBeRead && (!messageObject.isOut() && messageObject.isUnread() || messageObject.messageOwner.from_scheduled && id > currentReadMaxId) ||
                      (isThreadChat() || ChatObject.isMonoForum(currentChat)) && id > 0 && id > currentReadMaxId && id > replyMaxReadId
-                ) {
+                )) {
                     MessageObject.GroupedMessages group = getValidGroupedMessage(messageObject);
                     if (group != null) {
                         for (MessageObject msg : group.messages) {
+                            if (msg.getDialogId() != dialog_id) {
+                                continue;
+                            }
                             final int msg_id = msg.getId();
                             if (msg_id > 0) {
                                 maxPositiveUnreadId = Math.max(maxPositiveUnreadId, msg_id);

@@ -1561,6 +1561,7 @@ public class MessagesController extends BaseController implements NotificationCe
             getNotificationCenter().addObserver(messagesController, NotificationCenter.fileLoaded);
             getNotificationCenter().addObserver(messagesController, NotificationCenter.fileLoadFailed);
             getNotificationCenter().addObserver(messagesController, NotificationCenter.messageReceivedByServer);
+            getNotificationCenter().addObserver(messagesController, NotificationCenter.messageReceivedByServer2);
             getNotificationCenter().addObserver(messagesController, NotificationCenter.updateMessageMedia);
         });
         addSupportUser();
@@ -6399,6 +6400,10 @@ public class MessagesController extends BaseController implements NotificationCe
                 Long totalSize = (Long) args[2];
                 uploadingWallpaperInfo.uploadingProgress = loadedSize / (float) totalSize;
             }
+        } else if (id == NotificationCenter.messageReceivedByServer2) {
+            // Unlike the UI event, this event is delivered during chat animations,
+            // before SendMessagesHelper clears the completed outgoing entry.
+            acknowledgeReadAfterSuccessfulSend((Integer) args[0], (Long) args[3], (Boolean) args[6]);
         } else if (id == NotificationCenter.messageReceivedByServer) {
             Boolean scheduled = (Boolean) args[6];
             if (scheduled) {
@@ -6456,6 +6461,7 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     public void cleanup() {
+        replyReadTracker.clear();
         getContactsController().cleanup();
         MediaController.getInstance().cleanup();
         getNotificationsController().cleanup();
@@ -14490,6 +14496,18 @@ public class MessagesController extends BaseController implements NotificationCe
         if (mid == 0 || ttl < 0) {
             return;
         }
+        if (GhostMode.isEnabled(currentAccount)) {
+            // A fresh view still starts local expiration. Replaying an old receipt
+            // must not restart its timer or leave a network retry queued for later.
+            if (createDeleteTask && taskId == 0) {
+                int time = getConnectionsManager().getCurrentTime();
+                getMessagesStorage().createTaskForMid(dialogId, mid, time, time, ttl, false);
+            }
+            if (taskId != 0) {
+                getMessagesStorage().removePendingTask(taskId);
+            }
+            return;
+        }
         if (DialogObject.isChatDialog(dialogId) && inputChannel == null) {
             inputChannel = getInputChannel(dialogId);
             if (inputChannel == null) {
@@ -14610,7 +14628,7 @@ public class MessagesController extends BaseController implements NotificationCe
             });
         } else {
             TLRPC.EncryptedChat chat = getEncryptedChat(DialogObject.getEncryptedChatId(task.dialogId));
-            if (chat.auth_key != null && chat.auth_key.length > 1 && chat instanceof TLRPC.TL_encryptedChat) {
+            if (chat instanceof TLRPC.TL_encryptedChat && chat.auth_key != null && chat.auth_key.length > 1) {
                 TLRPC.TL_messages_readEncryptedHistory req = new TLRPC.TL_messages_readEncryptedHistory();
                 req.peer = new TLRPC.TL_inputEncryptedChat();
                 req.peer.chat_id = chat.id;
@@ -14623,21 +14641,53 @@ public class MessagesController extends BaseController implements NotificationCe
         }
     }
 
-    public void sendReadAckAfterReply(long dialogId, long threadId, int maxId, int maxDate) {
-        if (DialogObject.isEncryptedDialog(dialogId)) {
-            if (maxDate <= 0) {
-                return;
-            }
-        } else if (maxId <= 0) {
+    private final ReplyReadTracker replyReadTracker = new ReplyReadTracker();
+
+    public void captureReadAckForOutgoingMessage(TLRPC.Message message, boolean scheduled) {
+        if (message == null || message.id >= 0 || !message.out || scheduled
+                || message.from_scheduled || MessageObject.isEphemeral(message)
+                || message.quick_reply_shortcut != null || message.quick_reply_shortcut_id != 0
+                || message.action != null && !(message.action instanceof TLRPC.TL_messageActionEmpty)) {
             return;
         }
+        long dialogId = MessageObject.getDialogId(message);
+        long threadId = 0;
+        if (getMessagesStorage().isMonoForum(dialogId)) {
+            threadId = MessageObject.getMonoForumTopicId(message);
+        } else if (isForum(dialogId)) {
+            threadId = MessageObject.getTopicId(currentAccount, message, true);
+        } else if (message.reply_to instanceof TLRPC.TL_messageReplyHeader
+                && (message.reply_to.reply_to_peer_id == null
+                    || DialogObject.getPeerDialogId(message.reply_to.reply_to_peer_id) == dialogId)) {
+            if (message.reply_to.reply_to_top_id != 0) {
+                threadId = message.reply_to.reply_to_top_id;
+            } else if (replyReadTracker.hasViewed(dialogId, message.reply_to.reply_to_msg_id)) {
+                // A reply directly to the discussion starter omits reply_to_top_id.
+                threadId = message.reply_to.reply_to_msg_id;
+            }
+        }
+        replyReadTracker.begin(message.id, dialogId, threadId, GhostMode.isEnabled(currentAccount));
+    }
 
+    public void forgetOutgoingReadAck(int localMessageId) {
+        replyReadTracker.forget(localMessageId);
+    }
+
+    private void acknowledgeReadAfterSuccessfulSend(int localMessageId, long dialogId, boolean scheduled) {
+        if (scheduled) {
+            replyReadTracker.forget(localMessageId);
+            return;
+        }
+        ReplyReadTracker.Boundary boundary = replyReadTracker.complete(localMessageId, dialogId);
+        if (boundary == null) {
+            return;
+        }
         ReadTask task = new ReadTask();
-        task.dialogId = dialogId;
-        task.replyId = threadId;
-        task.monoForumPeerId = getMessagesStorage().isMonoForum(dialogId) ? threadId : 0;
-        task.maxId = maxId;
-        task.maxDate = maxDate;
+        task.dialogId = boundary.dialogId;
+        task.replyId = boundary.threadId;
+        task.monoForumPeerId = boundary.monoForumPeerId;
+        task.maxId = boundary.maxId;
+        task.maxDate = boundary.maxDate;
         Utilities.stageQueue.postRunnable(() -> completeReadTask(task, true));
     }
 
@@ -14828,6 +14878,8 @@ public class MessagesController extends BaseController implements NotificationCe
         }
 
         AutoTranscribeController.getInstance(currentAccount).recordDialogRead(dialogId);
+        replyReadTracker.viewed(dialogId, threadId, monoForumPeerId, maxPositiveId, maxDate,
+                DialogObject.isEncryptedDialog(dialogId));
 
         if (createReadTask) {
             Utilities.stageQueue.postRunnable(() -> {

@@ -1766,6 +1766,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
     }
 
     protected void processSentMessage(int id) {
+        getMessagesController().forgetOutgoingReadAck(id);
         int prevSize = unsentMessages.size();
         unsentMessages.remove(id);
         if (prevSize != 0 && unsentMessages.size() == 0) {
@@ -7394,6 +7395,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
         if (message == null) {
             return;
         }
+        getMessagesController().captureReadAckForOutgoingMessage(message, scheduled);
         if (message.id > 0) {
             editingMessages.put(message.id, message);
         } else {
@@ -7411,6 +7413,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
     }
 
     protected TLRPC.Message removeFromSendingMessages(int mid, boolean scheduled) {
+        getMessagesController().forgetOutgoingReadAck(mid);
         TLRPC.Message message;
         if (mid > 0) {
             message = editingMessages.get(mid);
@@ -7460,6 +7463,7 @@ public class SendMessagesHelper extends BaseController implements NotificationCe
             return;
         }
         TLRPC.Message message = obj.messageOwner;
+        getMessagesController().captureReadAckForOutgoingMessage(message, obj.scheduled);
         boolean contains = uploadMessages.indexOfKey(message.id) >= 0;
         uploadMessages.put(message.id, message);
         if (!contains && !MessageObject.isEphemeral(message)) {
