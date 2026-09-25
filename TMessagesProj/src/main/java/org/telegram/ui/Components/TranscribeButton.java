@@ -666,6 +666,16 @@ public class TranscribeButton {
         );
     }
 
+    public static void requestTranscription(MessageObject messageObject) {
+        if (messageObject == null
+                || messageObject.messageOwner == null
+                || !UserConfig.getInstance(messageObject.currentAccount).isPremium()
+                || isTranscribing(messageObject)) {
+            return;
+        }
+        transcribePressed(messageObject, true, null);
+    }
+
     private static void transcribePressed(MessageObject messageObject, boolean open, ChatMessageCell.ChatMessageCellDelegate delegate) {
         if (messageObject == null || messageObject.messageOwner == null || !messageObject.isSent()) {
             return;
