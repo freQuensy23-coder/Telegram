@@ -157,6 +157,7 @@ import org.telegram.messenger.FactCheckController;
 import org.telegram.messenger.FileLoader;
 import org.telegram.messenger.FileLog;
 import org.telegram.messenger.FlagSecureReason;
+import org.telegram.messenger.GhostMode;
 import org.telegram.messenger.HashtagSearchController;
 import org.telegram.messenger.ImageLoader;
 import org.telegram.messenger.ImageLocation;
@@ -2051,6 +2052,9 @@ public class ChatActivity extends BaseFragment implements
                         TranscribeButton.showOffTranscribe(msg);
                     }
                 }
+            }
+            if (scheduleDate == 0 && GhostMode.isEnabled(currentAccount)) {
+                sendReadAckAfterReply();
             }
         }
 
@@ -12815,6 +12819,22 @@ public class ChatActivity extends BaseFragment implements
             getMessagesController().sendBotStart(currentUser, botUser = value);
             updateBottomOverlay();
         }
+    }
+
+    private void sendReadAckAfterReply() {
+        int maxId = 0;
+        int maxDate = 0;
+        for (int i = 0; i < messages.size(); i++) {
+            MessageObject messageObject = messages.get(i);
+            if (messageObject == null || messageObject.messageOwner == null || messageObject.isOut() || messageObject.scheduled) {
+                continue;
+            }
+            if (messageObject.getId() > 0) {
+                maxId = Math.max(maxId, messageObject.getId());
+            }
+            maxDate = Math.max(maxDate, messageObject.messageOwner.date);
+        }
+        getMessagesController().sendReadAckAfterReply(dialog_id, threadMessageId, maxId, maxDate);
     }
 
     private void afterMessageSend() {

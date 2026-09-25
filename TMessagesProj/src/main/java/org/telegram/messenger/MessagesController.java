@@ -14564,7 +14564,11 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     private void completeReadTask(ReadTask task) {
-        if (GhostMode.isEnabled(currentAccount)) {
+        completeReadTask(task, false);
+    }
+
+    private void completeReadTask(ReadTask task, boolean forceServerRead) {
+        if (GhostMode.isEnabled(currentAccount) && !forceServerRead) {
             return;
         }
         if (task.replyId != 0 && task.monoForumPeerId == 0) {
@@ -14617,6 +14621,24 @@ public class MessagesController extends BaseController implements NotificationCe
                 });
             }
         }
+    }
+
+    public void sendReadAckAfterReply(long dialogId, long threadId, int maxId, int maxDate) {
+        if (DialogObject.isEncryptedDialog(dialogId)) {
+            if (maxDate <= 0) {
+                return;
+            }
+        } else if (maxId <= 0) {
+            return;
+        }
+
+        ReadTask task = new ReadTask();
+        task.dialogId = dialogId;
+        task.replyId = threadId;
+        task.monoForumPeerId = getMessagesStorage().isMonoForum(dialogId) ? threadId : 0;
+        task.maxId = maxId;
+        task.maxDate = maxDate;
+        Utilities.stageQueue.postRunnable(() -> completeReadTask(task, true));
     }
 
     private void checkReadTasks() {
