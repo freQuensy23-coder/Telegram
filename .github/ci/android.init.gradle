@@ -1,0 +1,46 @@
+// CI-only configuration; local Android Studio builds keep their normal variants.
+gradle.beforeProject { project ->
+    ['com.android.application', 'com.android.library'].each { pluginId ->
+        project.pluginManager.withPlugin(pluginId) {
+            project.extensions.getByName('androidComponents').finalizeDsl { android ->
+                def requested = project.providers.gradleProperty('ciAbis').orNull
+                if (requested) {
+                    def abis = requested.split(',').toList()
+                    def supported = ['arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86']
+                    if (!abis || !supported.containsAll(abis)) {
+                        throw new GradleException("Unsupported CI ABI selection: $requested")
+                    }
+                    // Restrict both app and library native builds, including flavor overrides.
+                    ([android.defaultConfig] + android.productFlavors.toList() + android.buildTypes.toList()).each { config ->
+                        config.ndk.abiFilters.clear()
+                        config.ndk.abiFilters.addAll(abis)
+                    }
+                }
+                if (System.getenv('CI_CCACHE') == '1') {
+                    android.defaultConfig.externalNativeBuild.cmake.arguments.addAll([
+                        '-DCMAKE_C_COMPILER_LAUNCHER=ccache',
+                        '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache'
+                    ])
+                    if (System.getenv('BUILD_TYPE') == 'debug') {
+                        // Upstream adds full LTO globally. Avoid that cost for debug objects only.
+                        android.defaultConfig.externalNativeBuild.cmake.arguments.addAll([
+                            '-DCMAKE_C_FLAGS_DEBUG=-g -O0 -fno-lto',
+                            '-DCMAKE_CXX_FLAGS_DEBUG=-g -O0 -fno-lto',
+                            '-DCMAKE_SHARED_LINKER_FLAGS_DEBUG=-fno-lto'
+                        ])
+                    }
+                }
+                if (project.path == ':TMessagesProj_App' && System.getenv('BUILD_TYPE') == 'release') {
+                    ['CI_KEYSTORE_PATH', 'CI_KEY_ALIAS', 'CI_KEY_PASSWORD', 'CI_STORE_PASSWORD'].each { name ->
+                        if (!System.getenv(name)) throw new GradleException("Missing production signing setting: $name")
+                    }
+                    def signing = android.signingConfigs.getByName('release')
+                    signing.storeFile = new File(System.getenv('CI_KEYSTORE_PATH'))
+                    signing.keyAlias = System.getenv('CI_KEY_ALIAS')
+                    signing.keyPassword = System.getenv('CI_KEY_PASSWORD')
+                    signing.storePassword = System.getenv('CI_STORE_PASSWORD')
+                }
+            }
+        }
+    }
+}

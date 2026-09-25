@@ -2,106 +2,154 @@ name: Android APK
 
 on:
   push:
-    branches:
-      - '**'
+    branches: ['**']
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-jobs:
-  debug-apk:
-    name: Build debug APK
-    if: github.ref != 'refs/heads/master'
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+concurrency:
+  group: android-apk-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
+env:
+  BUILD_TYPE: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && 'release' || 'debug' }}
+  ANDROID_ABIS: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && 'arm64-v8a armeabi-v7a x86_64 x86' || 'arm64-v8a' }}
+  NDK_VERSION: '27.2.12479018'
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_COMPILERCHECK: content
+  CCACHE_MAXSIZE: 2G
+  CI_CCACHE: '1'
+
+jobs:
+  apk:
+    name: Build ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && 'release' || 'debug' }} APK
+    # Same-repository PRs already get a push build. Fork PRs never get signing secrets.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
+          persist-credentials: false
 
-      - name: Set up JDK
-        uses: actions/setup-java@v4
+      - name: Prepare production signing
+        if: env.BUILD_TYPE == 'release'
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in KEYSTORE KEY_ALIAS KEY_PASSWORD STORE_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Production signing is not configured. See docs/android-ci.md."
+              exit 1
+            fi
+          done
+          umask 077
+          printf '%s' "$KEYSTORE" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+          keytool -list -keystore "$RUNNER_TEMP/release.keystore" -storepass:env STORE_PASSWORD -alias "$KEY_ALIAS" >/dev/null
+
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Install Android toolchain
-        shell: bash
-        run: |
-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -n 1)"
-          fi
-          test -x "$SDKMANAGER"
-          yes | "$SDKMANAGER" --licenses >/dev/null || true
-          "$SDKMANAGER" \
-            "platforms;android-36" \
-            "build-tools;36.0.0" \
-            "ndk;27.2.12479018" \
-            "cmake;3.22.1"
-
-      - name: Build debug APK
-        run: ./gradlew :TMessagesProj_App:assembleAfatDebug --stacktrace
-
-      - name: Upload debug APK
-        uses: actions/upload-artifact@v4
+      - uses: gradle/actions/setup-gradle@v4
         with:
-          name: telegram-debug-${{ github.sha }}
-          path: TMessagesProj_App/build/outputs/apk/afat/debug/app.apk
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ccache ninja-build gperf libssl-dev zlib1g-dev
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          set +o pipefail
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          set -o pipefail
+          "$SDKMANAGER" 'platforms;android-36' 'build-tools;36.0.0' "ndk;$NDK_VERSION" 'cmake;3.22.1'
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "CMAKE_BIN=$ANDROID_HOME/cmake/3.22.1/bin/cmake" >> "$GITHUB_ENV"
+          echo "NINJA_BIN=$ANDROID_HOME/cmake/3.22.1/bin/ninja" >> "$GITHUB_ENV"
+          ccache --zero-stats
+
+      - name: Identify native inputs
+        id: native
+        run: |
+          echo "submodules=$(git submodule status --recursive | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: TMessagesProj/jni/prebuild/lib
+          key: native-v1-${{ runner.os }}-${{ env.NDK_VERSION }}-${{ env.BUILD_TYPE }}-${{ steps.native.outputs.submodules }}-${{ hashFiles('TMessagesProj/jni/prebuild/*.sh', 'TMessagesProj/jni/prebuild/lib/**', 'TMessagesProj/jni/CMakeLists.txt') }}
+
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-v1-${{ runner.os }}-${{ env.NDK_VERSION }}-${{ env.BUILD_TYPE }}-${{ github.sha }}
+          restore-keys: |
+            ccache-v1-${{ runner.os }}-${{ env.NDK_VERSION }}-${{ env.BUILD_TYPE }}-
+
+      - name: Check and prepare native archives
+        env:
+          ABIS: ${{ env.ANDROID_ABIS }}
+          JOBS: '2'
+        run: bash .github/ci/native-preflight.sh
+
+      - name: Build APK
+        env:
+          CI_KEYSTORE_PATH: ${{ runner.temp }}/release.keystore
+          CI_KEY_ALIAS: ${{ env.BUILD_TYPE == 'release' && secrets.ANDROID_KEY_ALIAS || '' }}
+          CI_KEY_PASSWORD: ${{ env.BUILD_TYPE == 'release' && secrets.ANDROID_KEY_PASSWORD || '' }}
+          CI_STORE_PASSWORD: ${{ env.BUILD_TYPE == 'release' && secrets.ANDROID_STORE_PASSWORD || '' }}
+        run: |
+          set -euo pipefail
+          if [[ "$BUILD_TYPE" == release ]]; then
+            TASK=assembleAfatRelease
+          else
+            TASK=assembleAfatDebug
+            unset CI_KEY_ALIAS CI_KEY_PASSWORD CI_STORE_PASSWORD CI_KEYSTORE_PATH
+          fi
+          ./gradlew ":TMessagesProj_App:$TASK" \
+            --init-script .github/ci/android.init.gradle \
+            "-PciAbis=${ANDROID_ABIS// /,}" \
+            '-Dorg.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g' \
+            --build-cache --max-workers=2 --console=plain --profile --stacktrace
+          python3 .github/ci/verify-apk.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: telegram-${{ env.BUILD_TYPE }}-${{ github.sha }}
+          path: TMessagesProj_App/build/outputs/apk/afat/${{ env.BUILD_TYPE }}/app.apk
           if-no-files-found: error
           retention-days: 14
 
-  release-apk:
-    name: Build release APK
-    if: github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 1
-
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Install Android toolchain
-        shell: bash
+      - name: Build diagnostics
+        if: always()
         run: |
-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -n 1)"
-          fi
-          test -x "$SDKMANAGER"
-          yes | "$SDKMANAGER" --licenses >/dev/null || true
-          "$SDKMANAGER" \
-            "platforms;android-36" \
-            "build-tools;36.0.0" \
-            "ndk;27.2.12479018" \
-            "cmake;3.22.1"
+          ccache --show-stats || true
+          df -h .
 
-      - name: Build release APK
-        run: ./gradlew :TMessagesProj_App:assembleAfatRelease --stacktrace
-
-      - name: Upload release APK
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: telegram-release-${{ github.sha }}
-          path: TMessagesProj_App/build/outputs/apk/afat/release/app.apk
-          if-no-files-found: error
-          retention-days: 30
+          name: build-diagnostics-${{ github.sha }}
+          path: |
+            build/reports/profile/
+            TMessagesProj/build/reports/
+            native-inventory.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.keystore"
