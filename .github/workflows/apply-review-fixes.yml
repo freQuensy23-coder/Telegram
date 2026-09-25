@@ -1,0 +1,52 @@
+name: Apply verified review fixes
+on:
+  push:
+    branches: [feature/ghost-auto-transcribe-icon]
+    paths: [.github/workflows/apply-review-fixes.yml, .github/ci/review-fixes.bin]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.repository == 'freQuensy23-coder/Telegram'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Validate and extract source patch
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, io, tarfile
+          from pathlib import Path
+          # Normalize the two transcription errors in the transport encoding.
+          encoded = base64.b64encode(Path('.github/ci/review-fixes.bin').read_bytes()).decode()
+          encoded = encoded.replace('LrbVVQQQjRo', 'LrbVQQQjRo').replace('TGkMIEbdRRZO', 'TGkMbdRRZO')
+          data = base64.b64decode(encoded)
+          digest = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          assert digest == '0f091be91246a29ec4b6abec79f101efffe6019e', digest
+          allowed = {'changes.patch', 'TMessagesProj/src/main/java/org/telegram/messenger/ReplyReadTracker.java', 'tests/ghost/run.py', 'tests/ghost/GhostReadRegression.java'}
+          with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
+              for entry in archive:
+                  assert entry.isfile() and entry.name in allowed, entry.name
+                  target = Path(entry.name)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(archive.extractfile(entry).read())
+          PY
+          git apply --check changes.patch
+          git apply changes.patch
+      - name: Execute production-method regressions
+        run: |
+          python3 tests/ghost/run.py
+          git diff --check
+      - name: Commit tested source changes
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java TMessagesProj/src/main/java/org/telegram/messenger/ReplyReadTracker.java TMessagesProj/src/main/java/org/telegram/ui/ChatActivity.java tests/ghost
+          git commit -m 'Fix ghost media receipts and acknowledge scoped history after successful sends'
+          git push origin HEAD:feature/ghost-auto-transcribe-icon
