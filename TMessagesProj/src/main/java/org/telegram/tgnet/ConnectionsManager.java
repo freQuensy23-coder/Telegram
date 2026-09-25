@@ -399,6 +399,7 @@ public class ConnectionsManager extends BaseController {
             if (BuildVars.LOGS_ENABLED) {
                 FileLog.d("ghost mode blocked read request " + object);
             }
+            object.freeResources();
             return;
         }
         if (BuildVars.LOGS_ENABLED) {
