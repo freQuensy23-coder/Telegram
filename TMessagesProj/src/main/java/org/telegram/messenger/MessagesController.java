@@ -1573,6 +1573,7 @@ public class MessagesController extends BaseController implements NotificationCe
             mainPreferences = ApplicationLoader.applicationContext.getSharedPreferences("mainconfig" + currentAccount, Activity.MODE_PRIVATE);
             emojiPreferences = ApplicationLoader.applicationContext.getSharedPreferences("emoji" + currentAccount, Activity.MODE_PRIVATE);
         }
+        AutoTranscribeController.getInstance(currentAccount);
         long time = System.currentTimeMillis();
 
         remoteConfigLoaded = mainPreferences.getBoolean("remoteConfigLoaded", false);
