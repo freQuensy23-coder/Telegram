@@ -24,6 +24,7 @@ public class AccountInstance {
 
     public AccountInstance(int instance) {
         currentAccount = instance;
+        AutoTranscribeController.getInstance(instance);
     }
 
     public MessagesController getMessagesController() {
