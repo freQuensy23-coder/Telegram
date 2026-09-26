@@ -36,10 +36,13 @@ sha256 = hashlib.sha256(apk.read_bytes()).hexdigest()
 (output / 'app.apk.sha256').write_text(sha256 + '  app.apk\n')
 def git(*args):
     return subprocess.check_output(['git', *args], text=True).strip()
+# Raw commit headers retain parents even when checkout uses fetch-depth: 1.
+headers = git('cat-file', '-p', 'HEAD').split('\n\n', 1)[0]
+parents = [line.split()[1] for line in headers.splitlines() if line.startswith('parent ')]
 metadata = {
     'commit': git('rev-parse', 'HEAD'),
     'tree': git('rev-parse', 'HEAD^{tree}'),
-    'parents': git('show', '-s', '--format=%P', 'HEAD').split(),
+    'parents': parents,
     'variant': os.environ['BUILD_TYPE'],
     'abis': os.environ['ANDROID_ABIS'].split(),
     'apk_sha256': sha256,
