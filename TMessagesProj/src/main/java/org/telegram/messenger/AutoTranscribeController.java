@@ -9,32 +9,21 @@ import org.telegram.ui.Components.TranscribeButton;
 import java.util.ArrayList;
 
 /**
- * Automatically transcribes incoming voice messages for Premium accounts.
- *
- * Private dialogs are always eligible. Group/channel dialogs are eligible
- * after at least three distinct read sessions in the previous 14 days.
- * Read-session metadata is stored only on-device.
+ * Premium-only automatic transcription. Private cloud chats are always eligible;
+ * groups/channels require three read sessions in the last 14 days, 30 minutes apart.
  */
 public final class AutoTranscribeController implements NotificationCenter.NotificationCenterDelegate {
-
     private static final int MIN_READ_SESSIONS = 3;
     private static final long READ_WINDOW_MS = 14L * 24L * 60L * 60L * 1000L;
     private static final long READ_SESSION_GAP_MS = 30L * 60L * 1000L;
-
     private static final AutoTranscribeController[] instances =
             new AutoTranscribeController[UserConfig.MAX_ACCOUNT_COUNT];
 
-    public static AutoTranscribeController getInstance(int account) {
-        AutoTranscribeController instance = instances[account];
-        if (instance == null) {
-            synchronized (AutoTranscribeController.class) {
-                instance = instances[account];
-                if (instance == null) {
-                    instances[account] = instance = new AutoTranscribeController(account);
-                }
-            }
+    public static synchronized AutoTranscribeController getInstance(int account) {
+        if (instances[account] == null) {
+            instances[account] = new AutoTranscribeController(account);
         }
-        return instance;
+        return instances[account];
     }
 
     private final int currentAccount;
@@ -44,32 +33,26 @@ public final class AutoTranscribeController implements NotificationCenter.Notifi
         currentAccount = account;
         preferences = ApplicationLoader.applicationContext.getSharedPreferences(
                 "auto_transcribe_" + account, Context.MODE_PRIVATE);
-        NotificationCenter.getInstance(account).addObserver(
-                this, NotificationCenter.didReceiveNewMessages);
+        // MessagesController can be initialized by a background receiver.
+        AndroidUtilities.runOnUIThread(() -> {
+            NotificationCenter center = NotificationCenter.getInstance(account);
+            center.addObserver(this, NotificationCenter.didReceiveNewMessages);
+            center.addObserver(this, NotificationCenter.appDidLogout);
+        });
     }
 
     public synchronized void recordDialogRead(long dialogId) {
-        if (!DialogObject.isChatDialog(dialogId)) {
-            return;
-        }
-
+        if (!DialogObject.isChatDialog(dialogId)) return;
         long now = System.currentTimeMillis();
         ArrayList<Long> reads = getRecentReads(dialogId, now);
-        if (!reads.isEmpty() && now - reads.get(reads.size() - 1) < READ_SESSION_GAP_MS) {
-            return;
-        }
-
+        if (!reads.isEmpty() && now - reads.get(reads.size() - 1) < READ_SESSION_GAP_MS) return;
         reads.add(now);
         saveReads(dialogId, reads);
     }
 
     private synchronized boolean isRegularDialog(long dialogId) {
-        if (!DialogObject.isChatDialog(dialogId)) {
-            return false;
-        }
-
-        long now = System.currentTimeMillis();
-        ArrayList<Long> reads = getRecentReads(dialogId, now);
+        if (!DialogObject.isChatDialog(dialogId)) return false;
+        ArrayList<Long> reads = getRecentReads(dialogId, System.currentTimeMillis());
         saveReads(dialogId, reads);
         return reads.size() >= MIN_READ_SESSIONS;
     }
@@ -77,18 +60,12 @@ public final class AutoTranscribeController implements NotificationCenter.Notifi
     private ArrayList<Long> getRecentReads(long dialogId, long now) {
         String stored = preferences.getString(readsKey(dialogId), "");
         ArrayList<Long> result = new ArrayList<>();
-        if (TextUtils.isEmpty(stored)) {
-            return result;
-        }
-
+        if (TextUtils.isEmpty(stored)) return result;
         long cutoff = now - READ_WINDOW_MS;
-        String[] values = stored.split(",");
-        for (String value : values) {
+        for (String value : stored.split(",")) {
             try {
                 long timestamp = Long.parseLong(value);
-                if (timestamp >= cutoff && timestamp <= now) {
-                    result.add(timestamp);
-                }
+                if (timestamp >= cutoff && timestamp <= now) result.add(timestamp);
             } catch (NumberFormatException ignore) {
             }
         }
@@ -98,9 +75,7 @@ public final class AutoTranscribeController implements NotificationCenter.Notifi
     private void saveReads(long dialogId, ArrayList<Long> reads) {
         StringBuilder builder = new StringBuilder();
         for (int i = 0; i < reads.size(); i++) {
-            if (i > 0) {
-                builder.append(',');
-            }
+            if (i > 0) builder.append(',');
             builder.append(reads.get(i));
         }
         preferences.edit().putString(readsKey(dialogId), builder.toString()).apply();
@@ -120,35 +95,28 @@ public final class AutoTranscribeController implements NotificationCenter.Notifi
     @SuppressWarnings("unchecked")
     @Override
     public void didReceivedNotification(int id, int account, Object... args) {
+        if (account != currentAccount) return;
+        if (id == NotificationCenter.appDidLogout) {
+            // An account slot may later belong to a different Telegram user.
+            synchronized (this) {
+                preferences.edit().clear().apply();
+            }
+            return;
+        }
         if (id != NotificationCenter.didReceiveNewMessages
-                || account != currentAccount
-                || args.length < 3
-                || Boolean.TRUE.equals(args[2])
-                || !UserConfig.getInstance(currentAccount).isPremium()) {
-            return;
-        }
-
+                || args.length < 3 || Boolean.TRUE.equals(args[2])
+                || !UserConfig.getInstance(currentAccount).isPremium()) return;
         long dialogId = (Long) args[0];
-        if (DialogObject.isEncryptedDialog(dialogId) || !shouldAutoTranscribe(dialogId)) {
-            return;
-        }
-
+        if (DialogObject.isEncryptedDialog(dialogId) || !shouldAutoTranscribe(dialogId)) return;
         ArrayList<MessageObject> messages = (ArrayList<MessageObject>) args[1];
-        if (messages == null || messages.isEmpty()) {
-            return;
-        }
-
+        if (messages == null) return;
         for (MessageObject message : messages) {
-            if (message == null
-                    || message.isOut()
-                    || !message.isVoice()
-                    || !message.isSent()
-                    || message.messageOwner == null
+            if (message == null || message.messageOwner == null
+                    || message.currentAccount != currentAccount || message.getDialogId() != dialogId
+                    || message.scheduled || message.isOut() || !message.isVoice() || !message.isSent()
                     || message.messageOwner.voiceTranscriptionFinal
                     || !TextUtils.isEmpty(message.messageOwner.voiceTranscription)
-                    || TranscribeButton.isTranscribing(message)) {
-                continue;
-            }
+                    || TranscribeButton.isTranscribing(message)) continue;
             TranscribeButton.requestTranscription(message);
         }
     }

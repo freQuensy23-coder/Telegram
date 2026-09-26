@@ -8,6 +8,7 @@ This is not an APK build or a device test.
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -80,6 +81,7 @@ def main() -> None:
                         str(JAVA / 'messenger/ReplyReadTracker.java')], check=True)
         subprocess.run(['java', '-ea', '-cp', str(work),
                         'org.telegram.messenger.GhostReadRegression'], check=True)
+    subprocess.run([sys.executable, str(Path(__file__).with_name('auto_transcribe.py'))], check=True)
 
 
 if __name__ == '__main__':
