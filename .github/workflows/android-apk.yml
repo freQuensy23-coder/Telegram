@@ -1,0 +1,159 @@
+name: Android APK
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && 'release' || 'debug' }}
+  ANDROID_ABIS: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && 'arm64-v8a armeabi-v7a x86_64 x86' || 'arm64-v8a' }}
+  NDK_VERSION: '27.2.12479018'
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_COMPILERCHECK: content
+  CCACHE_MAXSIZE: 2G
+  CI_CCACHE: '1'
+
+jobs:
+  apk:
+    name: Build ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && 'release' || 'debug' }} APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prepare production signing
+        if: env.BUILD_TYPE == 'release'
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in KEYSTORE KEY_ALIAS KEY_PASSWORD STORE_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Production signing is not configured. See docs/android-ci.md."
+              exit 1
+            fi
+          done
+          umask 077
+          printf '%s' "$KEYSTORE" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+          keytool -list -keystore "$RUNNER_TEMP/release.keystore" -storepass:env STORE_PASSWORD -alias "$KEY_ALIAS" >/dev/null
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Run client regressions when present
+        run: |
+          if [[ -f tests/ghost/run.py ]]; then
+            python3 tests/ghost/run.py
+          fi
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ccache ninja-build gperf libssl-dev zlib1g-dev
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          set +o pipefail
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          set -o pipefail
+          "$SDKMANAGER" 'platforms;android-36' 'build-tools;36.0.0' "ndk;$NDK_VERSION" 'cmake;3.22.1'
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "CMAKE_BIN=$ANDROID_HOME/cmake/3.22.1/bin/cmake" >> "$GITHUB_ENV"
+          echo "NINJA_BIN=$ANDROID_HOME/cmake/3.22.1/bin/ninja" >> "$GITHUB_ENV"
+
+      - name: Identify native inputs
+        id: native
+        run: |
+          echo "submodules=$(git submodule status --recursive | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: TMessagesProj/jni/prebuild/lib
+          key: native-v1-${{ runner.os }}-${{ env.NDK_VERSION }}-${{ env.BUILD_TYPE }}-${{ steps.native.outputs.submodules }}-${{ hashFiles('TMessagesProj/jni/prebuild/*.sh', 'TMessagesProj/jni/prebuild/lib/**', 'TMessagesProj/jni/CMakeLists.txt') }}
+
+      - name: Restore compiler cache
+        id: ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-v1-${{ runner.os }}-${{ env.NDK_VERSION }}-${{ env.BUILD_TYPE }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-v1-${{ runner.os }}-${{ env.NDK_VERSION }}-${{ env.BUILD_TYPE }}-
+
+      - name: Check and prepare native archives
+        env:
+          ABIS: ${{ env.ANDROID_ABIS }}
+          JOBS: '2'
+        run: |
+          ccache --zero-stats
+          bash .github/ci/native-preflight.sh
+
+      - name: Compile, assemble and verify APK
+        env:
+          CI_KEYSTORE_PATH: ${{ runner.temp }}/release.keystore
+          CI_KEY_ALIAS: ${{ env.BUILD_TYPE == 'release' && secrets.ANDROID_KEY_ALIAS || '' }}
+          CI_KEY_PASSWORD: ${{ env.BUILD_TYPE == 'release' && secrets.ANDROID_KEY_PASSWORD || '' }}
+          CI_STORE_PASSWORD: ${{ env.BUILD_TYPE == 'release' && secrets.ANDROID_STORE_PASSWORD || '' }}
+        run: bash .github/ci/build-apk.sh
+
+      - name: Preserve compiled objects even if a later build stage fails
+        if: ${{ !cancelled() && steps.ccache.outcome == 'success' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: telegram-${{ env.BUILD_TYPE }}-${{ github.sha }}
+          path: |
+            TMessagesProj_App/build/outputs/apk/afat/${{ env.BUILD_TYPE }}/app.apk
+            TMessagesProj_App/build/outputs/apk/afat/${{ env.BUILD_TYPE }}/app.apk.sha256
+            TMessagesProj_App/build/outputs/apk/afat/${{ env.BUILD_TYPE }}/build-info.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build diagnostics
+        if: always()
+        run: |
+          ccache --show-stats || true
+          df -h .
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-diagnostics-${{ github.sha }}
+          path: |
+            build/reports/profile/
+            TMessagesProj/build/reports/
+            native-inventory.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.keystore"
