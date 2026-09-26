@@ -1,0 +1,55 @@
+name: Ghost mode regressions
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'TMessagesProj/src/main/java/**'
+      - 'tests/ghost/**'
+      - '.github/workflows/ghost-regressions.yml'
+  pull_request:
+    paths:
+      - 'TMessagesProj/src/main/java/**'
+      - 'tests/ghost/**'
+      - '.github/workflows/ghost-regressions.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ghost-regressions-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  regressions:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - run: python3 tests/ghost/run.py
+  android-java:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+      - name: Install compile toolchain
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platforms;android-36' 'build-tools;36.0.0' 'ndk;27.2.12479018' 'cmake;3.22.1'
+      - name: Compile actual Android sources
+        run: |
+          ./gradlew :TMessagesProj:compileDebugJavaWithJavac --build-cache --max-workers=2 --console=plain --stacktrace '-Dorg.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g'
