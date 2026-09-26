@@ -27,7 +27,7 @@ jobs:
   apk:
     name: Build ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && 'release' || 'debug' }} APK
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,6 +59,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Run client regressions when present
+        run: |
+          if [[ -f tests/ghost/run.py ]]; then
+            python3 tests/ghost/run.py
+          fi
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           cache-read-only: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
@@ -78,7 +84,6 @@ jobs:
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "CMAKE_BIN=$ANDROID_HOME/cmake/3.22.1/bin/cmake" >> "$GITHUB_ENV"
           echo "NINJA_BIN=$ANDROID_HOME/cmake/3.22.1/bin/ninja" >> "$GITHUB_ENV"
-          ccache --zero-stats
 
       - name: Identify native inputs
         id: native
@@ -90,10 +95,12 @@ jobs:
           path: TMessagesProj/jni/prebuild/lib
           key: native-v1-${{ runner.os }}-${{ env.NDK_VERSION }}-${{ env.BUILD_TYPE }}-${{ steps.native.outputs.submodules }}-${{ hashFiles('TMessagesProj/jni/prebuild/*.sh', 'TMessagesProj/jni/prebuild/lib/**', 'TMessagesProj/jni/CMakeLists.txt') }}
 
-      - uses: actions/cache@v4
+      - name: Restore compiler cache
+        id: ccache
+        uses: actions/cache/restore@v4
         with:
           path: .ccache
-          key: ccache-v1-${{ runner.os }}-${{ env.NDK_VERSION }}-${{ env.BUILD_TYPE }}-${{ github.sha }}
+          key: ccache-v1-${{ runner.os }}-${{ env.NDK_VERSION }}-${{ env.BUILD_TYPE }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             ccache-v1-${{ runner.os }}-${{ env.NDK_VERSION }}-${{ env.BUILD_TYPE }}-
 
@@ -101,35 +108,32 @@ jobs:
         env:
           ABIS: ${{ env.ANDROID_ABIS }}
           JOBS: '2'
-        run: bash .github/ci/native-preflight.sh
+        run: |
+          ccache --zero-stats
+          bash .github/ci/native-preflight.sh
 
-      - name: Build APK
+      - name: Compile, assemble and verify APK
         env:
           CI_KEYSTORE_PATH: ${{ runner.temp }}/release.keystore
           CI_KEY_ALIAS: ${{ env.BUILD_TYPE == 'release' && secrets.ANDROID_KEY_ALIAS || '' }}
           CI_KEY_PASSWORD: ${{ env.BUILD_TYPE == 'release' && secrets.ANDROID_KEY_PASSWORD || '' }}
           CI_STORE_PASSWORD: ${{ env.BUILD_TYPE == 'release' && secrets.ANDROID_STORE_PASSWORD || '' }}
-        run: |
-          set -euo pipefail
-          if [[ "$BUILD_TYPE" == release ]]; then
-            TASK=assembleAfatRelease
-            HEAP=8g
-          else
-            TASK=assembleAfatDebug
-            HEAP=6g
-            unset CI_KEY_ALIAS CI_KEY_PASSWORD CI_STORE_PASSWORD CI_KEYSTORE_PATH
-          fi
-          ./gradlew ":TMessagesProj_App:$TASK" \
-            --init-script .github/ci/android.init.gradle \
-            "-PciAbis=${ANDROID_ABIS// /,}" \
-            "-Dorg.gradle.jvmargs=-Xmx$HEAP -XX:MaxMetaspaceSize=1g" \
-            --build-cache --max-workers=2 --console=plain --profile --stacktrace
-          python3 .github/ci/verify-apk.py
+        run: bash .github/ci/build-apk.sh
+
+      - name: Preserve compiled objects even if a later build stage fails
+        if: ${{ !cancelled() && steps.ccache.outcome == 'success' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
 
       - uses: actions/upload-artifact@v4
         with:
           name: telegram-${{ env.BUILD_TYPE }}-${{ github.sha }}
-          path: TMessagesProj_App/build/outputs/apk/afat/${{ env.BUILD_TYPE }}/app.apk
+          path: |
+            TMessagesProj_App/build/outputs/apk/afat/${{ env.BUILD_TYPE }}/app.apk
+            TMessagesProj_App/build/outputs/apk/afat/${{ env.BUILD_TYPE }}/app.apk.sha256
+            TMessagesProj_App/build/outputs/apk/afat/${{ env.BUILD_TYPE }}/build-info.json
           if-no-files-found: error
           retention-days: 14
 
